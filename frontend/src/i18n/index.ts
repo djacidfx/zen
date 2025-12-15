@@ -48,6 +48,14 @@ export const LOCALE_LABELS: LocaleItem[] = [
   { value: 'fr-FR', label: 'Français' },
 ];
 
+// Sort language options into a consistent, user-friendly alphabetical order.
+// Uses Unicode root collation ("und") to keep the order stable and identical for everyone.
+const localeLabelsCollator = new Intl.Collator('und', {
+  usage: 'sort',
+  sensitivity: 'base',
+});
+LOCALE_LABELS.sort((a, b) => localeLabelsCollator.compare(a.label, b.label));
+
 export function detectSystemLocale(): SupportedLocale {
   const browserLang = navigator.language;
   const detected = SUPPORTED_LOCALES.includes(browserLang as any) ? (browserLang as SupportedLocale) : FALLBACK_LOCALE;

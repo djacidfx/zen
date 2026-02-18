@@ -1,7 +1,6 @@
 package selfupdate
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -20,36 +19,20 @@ import (
 	"github.com/ZenPrivacy/zen-desktop/internal/cfg"
 )
 
-type selfupdateEventsEmitter interface {
-	OnUpdateAvailable()
-}
-
 // NoSelfUpdate is set to "true" for builds distributed to package managers to prevent auto-updating. It is typed as a string because the linker allows only setting string variables at compile time (see https://pkg.go.dev/cmd/link).
 // Set at compile time using ldflags (see the prod-noupdate task in the /tasks/build directory).
 var NoSelfUpdate = "false"
 
-// releaseTrack is the release track to follow for updates. It currently only takes the value "stable".
-var releaseTrack = "stable"
-
-// manifestsBaseURL is the base URL for fetching update manifests.
-const manifestsBaseURL = "https://update-manifests.zenprivacy.net"
-
-type httpClient interface {
-	Do(req *http.Request) (*http.Response, error)
-}
-
-type SelfUpdater struct {
-	version       string
-	noSelfUpdate  bool
-	config        *cfg.Config
-	releaseTrack  string
-	httpClient    httpClient
-	eventsEmitter selfupdateEventsEmitter
-	restartApp    func() error
-
-	// applyUpdateMu ensures that only one applyUpdate runs at a time.
-	applyUpdateMu sync.Mutex
-}
+const (
+	// releaseTrack is the release track to follow for updates. It currently only takes the value "stable".
+	releaseTrack = "stable"
+	// manifestsBaseURL is the base URL for fetching update manifests.
+	manifestsBaseURL = "https://update-manifests.zenprivacy.net"
+	// checkInterval sets the frequency with which to check for updates.
+	checkInterval = 6 * time.Hour
+	// httpTimeout is the timeout for HTTP requests when checking for updates and downloading update files.
+	httpTimeout = 5 * time.Minute
+)
 
 type release struct {
 	Version     string `json:"version"`
@@ -58,107 +41,96 @@ type release struct {
 	SHA256      string `json:"sha256"`
 }
 
-func NewSelfUpdater(httpClient httpClient, config *cfg.Config, eventsEmitter selfupdateEventsEmitter, restartApp func() error) (*SelfUpdater, error) {
-	if httpClient == nil {
-		return nil, errors.New("httpClient is nil")
+type httpClient interface {
+	Do(req *http.Request) (*http.Response, error)
+}
+
+type eventsEmitter interface {
+	OnUpdateAvailable()
+}
+
+type SelfUpdater struct {
+	version       string
+	config        *cfg.Config
+	httpClient    httpClient
+	eventsEmitter eventsEmitter
+
+	// execUpdateMu ensures that only one applyUpdate runs at a time.
+	execUpdateMu sync.Mutex
+}
+
+// NewSelfUpdater returns nil if the app should not self-update.
+func NewSelfUpdater(config *cfg.Config, eventsEmitter eventsEmitter) (*SelfUpdater, error) {
+	if NoSelfUpdate == "true" {
+		log.Printf("NoSelfUpdate=true; self-updates disabled")
+		return nil, nil
 	}
-	if eventsEmitter == nil {
-		return nil, errors.New("eventsEmitter is nil")
+
+	if config == nil {
+		return nil, errors.New("config is nil")
 	}
 	if cfg.Version == "" {
 		return nil, errors.New("cfg.Version is empty")
 	}
-	if restartApp == nil {
-		return nil, errors.New("restartApp is nil")
+	if eventsEmitter == nil {
+		return nil, errors.New("eventsEmitter is nil")
+	}
+
+	if cfg.Version == "development" {
+		log.Printf("cfg.Version=development; self-updates disabled")
+		return nil, nil
+	}
+
+	httpClient := &http.Client{
+		Timeout: httpTimeout,
 	}
 
 	u := SelfUpdater{
 		version:       cfg.Version,
 		config:        config,
-		releaseTrack:  releaseTrack,
 		httpClient:    httpClient,
 		eventsEmitter: eventsEmitter,
-		restartApp:    restartApp,
-	}
-	switch NoSelfUpdate {
-	case "true":
-		u.noSelfUpdate = true
-	case "false":
-	default:
-		return nil, fmt.Errorf("invalid noSelfUpdate value: %s", NoSelfUpdate)
 	}
 
 	return &u, nil
 }
 
-func (su *SelfUpdater) checkForUpdates() (*release, error) {
-	log.Println("checking for updates")
-	if su.noSelfUpdate {
-		log.Println("noSelfUpdate=true, self-update disabled")
-		return nil, nil
+func (su *SelfUpdater) RunScheduledUpdateChecks() {
+	check := func() bool {
+		policy := su.config.GetUpdatePolicy()
+		if policy != cfg.UpdatePolicyAutomatic {
+			return false
+		}
+
+		updated, err := su.execUpdate()
+		if err != nil {
+			log.Printf("failed to apply update: %v", err)
+		}
+		if updated {
+			su.eventsEmitter.OnUpdateAvailable()
+			return true
+		}
+		return false
 	}
 
-	if su.version == "development" {
-		log.Println("version=development, self-update disabled")
-		return nil, nil
+	if check() {
+		return
 	}
 
-	url := fmt.Sprintf("%s/%s/%s/%s/manifest.json", manifestsBaseURL, su.releaseTrack, runtime.GOOS, runtime.GOARCH)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if check() {
+			return
+		}
 	}
-
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "zen-desktop")
-
-	res, err := su.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("do request: %w", err)
-	}
-
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("manifest request failed with status code %d", res.StatusCode)
-	}
-
-	defer res.Body.Close()
-
-	var rel release
-	if err := json.NewDecoder(res.Body).Decode(&rel); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-
-	return &rel, nil
 }
 
-// isNewer compares the current version with the version passed as an argument and returns true if the argument is newer.
-//
-// It assumes that both versions are in the format "v<major>.<minor>.<patch>" and returns an error if they are not.
-func (su *SelfUpdater) isNewer(version string) (bool, error) {
-	var currentMajor, currentMinor, currentPatch, newMajor, newMinor, newPatch int
-	if _, err := fmt.Sscanf(su.version, "v%d.%d.%d", &currentMajor, &currentMinor, &currentPatch); err != nil {
-		return false, fmt.Errorf("parse current version (%s): %w", su.version, err)
-	}
-	if _, err := fmt.Sscanf(version, "v%d.%d.%d", &newMajor, &newMinor, &newPatch); err != nil {
-		return false, fmt.Errorf("parse new version (%s): %w", version, err)
-	}
-
-	if newMajor > currentMajor {
-		return true, nil
-	}
-	if newMajor == currentMajor && newMinor > currentMinor {
-		return true, nil
-	}
-	if newMajor == currentMajor && newMinor == currentMinor && newPatch > currentPatch {
-		return true, nil
-	}
-
-	return false, nil
-}
-
-func (su *SelfUpdater) applyUpdate() (bool, error) {
-	su.applyUpdateMu.Lock()
-	defer su.applyUpdateMu.Unlock()
+// execUpdate checks and executes an update if available. Returns true if an update was applied.
+func (su *SelfUpdater) execUpdate() (bool, error) {
+	su.execUpdateMu.Lock()
+	defer su.execUpdateMu.Unlock()
 
 	rel, err := su.checkForUpdates()
 	if err != nil {
@@ -195,9 +167,64 @@ func (su *SelfUpdater) applyUpdate() (bool, error) {
 		panic("unsupported platform")
 	}
 
-	log.Println("update installed successfully")
+	log.Printf("update %s installed successfully", rel.Version)
 
 	return true, nil
+}
+
+func (su *SelfUpdater) checkForUpdates() (*release, error) {
+	log.Println("checking for updates")
+
+	url := fmt.Sprintf("%s/%s/%s/%s/manifest.json", manifestsBaseURL, releaseTrack, runtime.GOOS, runtime.GOARCH)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "zen-desktop")
+
+	resp, err := su.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("manifest request failed with status code %d", resp.StatusCode)
+	}
+
+	var rel release
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	return &rel, nil
+}
+
+// isNewer compares the current version with the version passed as an argument and returns true if the argument is newer.
+//
+// It assumes that both versions are in the format "v<major>.<minor>.<patch>" and returns an error if they are not.
+func (su *SelfUpdater) isNewer(version string) (bool, error) {
+	var currentMajor, currentMinor, currentPatch, newMajor, newMinor, newPatch int
+	if _, err := fmt.Sscanf(su.version, "v%d.%d.%d", &currentMajor, &currentMinor, &currentPatch); err != nil {
+		return false, fmt.Errorf("parse current version (%s): %w", su.version, err)
+	}
+	if _, err := fmt.Sscanf(version, "v%d.%d.%d", &newMajor, &newMinor, &newPatch); err != nil {
+		return false, fmt.Errorf("parse new version (%s): %w", version, err)
+	}
+
+	if newMajor > currentMajor {
+		return true, nil
+	}
+	if newMajor == currentMajor && newMinor > currentMinor {
+		return true, nil
+	}
+	if newMajor == currentMajor && newMinor == currentMinor && newPatch > currentPatch {
+		return true, nil
+	}
+
+	return false, nil
 }
 
 func (su *SelfUpdater) downloadFile(url, filePath string) error {
@@ -218,12 +245,11 @@ func (su *SelfUpdater) downloadFile(url, filePath string) error {
 	if err != nil {
 		return fmt.Errorf("download file: %w", err)
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download file failed with status code %d", resp.StatusCode)
 	}
-
-	defer resp.Body.Close()
 
 	_, err = io.Copy(out, resp.Body)
 	if err != nil {
@@ -414,55 +440,4 @@ func findAppBundleInDir(dir string) (string, error) {
 func generateBackupName(originalName string) string {
 	timestamp := time.Now().UnixMilli()
 	return fmt.Sprintf("%s.backup-%d", originalName, timestamp)
-}
-
-func (su *SelfUpdater) StartPeriodicChecks(
-	ctx context.Context,
-	interval time.Duration,
-) {
-	if su.noSelfUpdate {
-		log.Println("self-update disabled, skipping periodic update checks")
-		return
-	}
-
-	// Initial check
-	policy := su.config.GetUpdatePolicy()
-	if policy == cfg.UpdatePolicyAutomatic {
-		if updated, err := su.applyUpdate(); err != nil {
-			log.Printf("failed to apply update: %v", err)
-		} else if updated {
-			if err := su.restartApp(); err != nil {
-				log.Printf("failed to restart application: %v", err)
-				su.eventsEmitter.OnUpdateAvailable()
-			}
-			return
-		}
-	}
-
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				policy := su.config.GetUpdatePolicy()
-				if policy != cfg.UpdatePolicyAutomatic {
-					continue
-				}
-
-				updated, err := su.applyUpdate()
-				if err != nil {
-					log.Printf("failed to apply update: %v", err)
-					continue
-				}
-				if updated {
-					su.eventsEmitter.OnUpdateAvailable()
-					return // Stop further checks
-				}
-			}
-		}
-	}()
 }

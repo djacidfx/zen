@@ -7,15 +7,22 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 
 	"github.com/ZenPrivacy/zen-desktop/internal/autostart"
 	"github.com/blang/semver"
 )
 
-// migrations is a map of version to migration function.
-// Warning: RunMigration() runs the migrations in arbitrary order.
-var migrations = map[string]func(c *Config) error{
-	"v0.3.0": func(c *Config) error {
+type migration struct {
+	version string
+	fn      func(c *Config) error
+}
+
+// migrations is an ordered list of version migrations.
+// Maintainers: always append new migrations to the end of this slice.
+// Do not reorder existing entries - migrations run sequentially from first to last.
+var migrations = []migration{
+	{"v0.3.0", func(c *Config) error {
 		errStr := c.AddFilterList(FilterList{
 			Name:    "DandelionSprout's URL Shortener",
 			Type:    "privacy",
@@ -27,16 +34,16 @@ var migrations = map[string]func(c *Config) error{
 			return err
 		}
 		return nil
-	},
-	"v0.6.0": func(c *Config) error {
+	}},
+	{"v0.6.0", func(c *Config) error {
 		// https://github.com/ZenPrivacy/zen-desktop/issues/146
 		errStr := c.ToggleFilterList("https://raw.githubusercontent.com/AdguardTeam/FiltersRegistry/master/filters/filter_2_Base/filter.txt", true)
 		if errStr != "" {
 			return errors.New(errStr)
 		}
 		return nil
-	},
-	"v0.7.0": func(c *Config) error {
+	}},
+	{"v0.7.0", func(c *Config) error {
 		// https://github.com/ZenPrivacy/zen-desktop/issues/147#issuecomment-2521317897
 		c.Lock()
 		defer c.Unlock()
@@ -55,8 +62,8 @@ var migrations = map[string]func(c *Config) error{
 			return fmt.Errorf("save config: %v", err)
 		}
 		return nil
-	},
-	"v0.9.0": func(c *Config) error {
+	}},
+	{"v0.9.0", func(c *Config) error {
 		c.Lock()
 		defer c.Unlock()
 
@@ -81,8 +88,8 @@ var migrations = map[string]func(c *Config) error{
 		}
 
 		return nil
-	},
-	"v0.10.0": func(c *Config) error {
+	}},
+	{"v0.10.0", func(c *Config) error {
 		for i, list := range c.Filter.FilterLists {
 			if list.URL == "https://raw.githubusercontent.com/hufilter/hufilter/master/hufilter.txt" {
 				c.Filter.FilterLists[i].URL = "https://filters.hufilter.hu/hufilter-adguard.txt"
@@ -102,8 +109,8 @@ var migrations = map[string]func(c *Config) error{
 			return fmt.Errorf("add \"Zen - Ads\" filter list: %s", errStr)
 		}
 		return nil
-	},
-	"v0.11.0": func(c *Config) error {
+	}},
+	{"v0.11.0", func(c *Config) error {
 		for i, list := range c.Filter.FilterLists {
 			if list.URL == "https://adblock.gardar.net/is.abp.txt" {
 				c.Filter.FilterLists[i].URL = "https://raw.githubusercontent.com/brave/adblock-lists/master/custom/is.txt"
@@ -128,8 +135,8 @@ var migrations = map[string]func(c *Config) error{
 			return fmt.Errorf("add \"Zen - Privacy\" filter list: %s", errStr)
 		}
 		return nil
-	},
-	"v0.11.3": func(c *Config) error {
+	}},
+	{"v0.11.3", func(c *Config) error {
 		for i, list := range c.Filter.FilterLists {
 			if list.URL == "https://malware-filter.gitlab.io/malware-filter/phishing-filter.txt" {
 				c.Filter.FilterLists[i].URL = "https://malware-filter.gitlab.io/malware-filter/phishing-filter-hosts.txt"
@@ -139,8 +146,8 @@ var migrations = map[string]func(c *Config) error{
 			return fmt.Errorf("save config: %v", err)
 		}
 		return nil
-	},
-	"v0.12.0": func(_ *Config) error {
+	}},
+	{"v0.12.0", func(_ *Config) error {
 		if runtime.GOOS == "darwin" {
 			autostart := autostart.Manager{}
 			enabled, err := autostart.IsEnabled()
@@ -159,8 +166,8 @@ var migrations = map[string]func(c *Config) error{
 		}
 
 		return nil
-	},
-	"v0.13.0": func(c *Config) error {
+	}},
+	{"v0.13.0", func(c *Config) error {
 		if c.UpdatePolicy == UpdatePolicyPrompt {
 			c.UpdatePolicy = UpdatePolicyAutomatic
 		}
@@ -169,8 +176,8 @@ var migrations = map[string]func(c *Config) error{
 			return fmt.Errorf("save config: %v", err)
 		}
 		return nil
-	},
-	"v0.16.0": func(c *Config) error {
+	}},
+	{"v0.16.0", func(c *Config) error {
 		c.Lock()
 		defer c.Unlock()
 
@@ -179,8 +186,8 @@ var migrations = map[string]func(c *Config) error{
 			return fmt.Errorf("save config: %v", err)
 		}
 		return nil
-	},
-	"v0.17.0": func(c *Config) error {
+	}},
+	{"v0.17.0", func(c *Config) error {
 		c.Lock()
 		defer c.Unlock()
 
@@ -189,8 +196,8 @@ var migrations = map[string]func(c *Config) error{
 			return fmt.Errorf("save config: %v", err)
 		}
 		return nil
-	},
-	"v0.18.0": func(c *Config) error {
+	}},
+	{"v0.18.0", func(c *Config) error {
 		lists := []FilterList{
 			{
 				Name:    "no-doomscroll - All",
@@ -254,10 +261,89 @@ var migrations = map[string]func(c *Config) error{
 			}
 		}
 		return nil
-	},
+	}},
+	{"v0.19.0", func(c *Config) error {
+		c.Lock()
+		defer c.Unlock()
+
+		const (
+			oldZenAdsURL     = "https://raw.githubusercontent.com/ZenPrivacy/filter-lists/master/ads/ads.txt"
+			newZenAdsURL     = "https://cdn.jsdelivr.net/gh/ZenPrivacy/filter-lists@master/ads/ads.txt"
+			oldZenPrivacyURL = "https://raw.githubusercontent.com/ZenPrivacy/filter-lists/master/privacy/privacy.txt"
+			newZenPrivacyURL = "https://cdn.jsdelivr.net/gh/ZenPrivacy/filter-lists@master/privacy/privacy.txt"
+			ytShortsURL      = "https://cdn.jsdelivr.net/gh/ZenPrivacy/filter-lists@master/no-doomscroll/youtube/shorts-zen.txt"
+			ytMainURL        = "https://cdn.jsdelivr.net/gh/ZenPrivacy/filter-lists@master/no-doomscroll/youtube/main-zen.txt"
+		)
+
+		// Remove all variants of Zen filter URLs and YouTube Shorts,
+		// then re-add with the correct jsDelivr URLs. This covers all
+		// cases: first migration (old URLs), repeat run (new URLs),
+		// and manual additions (both URLs present).
+		zenAdsEnabled := true
+		zenPrivacyEnabled := true
+		ytShortsEnabled := false
+		filtered := c.Filter.FilterLists[:0]
+		for _, list := range c.Filter.FilterLists {
+			switch list.URL {
+			case oldZenAdsURL, newZenAdsURL:
+				zenAdsEnabled = list.Enabled
+				continue
+			case oldZenPrivacyURL, newZenPrivacyURL:
+				zenPrivacyEnabled = list.Enabled
+				continue
+			case ytShortsURL:
+				ytShortsEnabled = list.Enabled
+				continue
+			}
+			filtered = append(filtered, list)
+		}
+		c.Filter.FilterLists = filtered
+
+		// Re-add Zen filter lists with jsDelivr URLs at the top.
+		c.Filter.FilterLists = append([]FilterList{
+			{
+				Name:    "Zen - Ads",
+				Type:    FilterListTypeAds,
+				URL:     newZenAdsURL,
+				Enabled: zenAdsEnabled,
+			},
+			{
+				Name:    "Zen - Privacy",
+				Type:    FilterListTypePrivacy,
+				URL:     newZenPrivacyURL,
+				Enabled: zenPrivacyEnabled,
+			},
+		}, c.Filter.FilterLists...)
+		log.Printf("v0.19.0 migration: added Zen - Ads and Zen - Privacy with jsDelivr URLs")
+
+		// Add YouTube Shorts list right after "no-doomscroll - YouTube".
+		shortsList := FilterList{
+			Name:    "no-doomscroll - YouTube Shorts",
+			Type:    FilterListTypeDigitalWellbeing,
+			URL:     ytShortsURL,
+			Enabled: ytShortsEnabled,
+		}
+		inserted := false
+		for i, list := range c.Filter.FilterLists {
+			if list.URL == ytMainURL {
+				c.Filter.FilterLists = slices.Insert(c.Filter.FilterLists, i+1, shortsList)
+				inserted = true
+				break
+			}
+		}
+		if !inserted {
+			c.Filter.FilterLists = append(c.Filter.FilterLists, shortsList)
+		}
+		log.Printf("v0.19.0 migration: added no-doomscroll - YouTube Shorts list")
+
+		if err := c.Save(); err != nil {
+			return fmt.Errorf("save config: %v", err)
+		}
+		return nil
+	}},
 }
 
-// RunMigrations runs the version-to-version migrations.
+// RunMigrations runs the version-to-version migrations in order.
 func (c *Config) RunMigrations() {
 	if Version == "development" {
 		log.Println("skipping migrations in development mode")
@@ -283,22 +369,22 @@ func (c *Config) RunMigrations() {
 
 	lastMigrationV, err := semver.ParseTolerant(lastMigration)
 	if err != nil {
-		log.Printf("error parsing last migration(%s): %v\n", lastMigration, err)
+		log.Printf("error parsing last migration(%s): %v", lastMigration, err)
 		return
 	}
 
-	for version, migration := range migrations {
-		versionV, err := semver.ParseTolerant(version)
+	for _, m := range migrations {
+		versionV, err := semver.ParseTolerant(m.version)
 		if err != nil {
-			log.Printf("error parsing migration version(%s): %v\n", version, err)
+			log.Printf("error parsing migration version(%s): %v", m.version, err)
 			continue
 		}
 
 		if lastMigrationV.LT(versionV) {
-			if err := migration(c); err != nil {
-				log.Printf("error running migration(%s): %v\n", version, err)
+			if err := m.fn(c); err != nil {
+				log.Printf("error running migration(%s): %v", m.version, err)
 			} else {
-				log.Printf("ran migration %s\n", version)
+				log.Printf("ran migration %s", m.version)
 			}
 		}
 	}

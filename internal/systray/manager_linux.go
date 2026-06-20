@@ -3,6 +3,7 @@ package systray
 import (
 	"context"
 	"log"
+	"sync/atomic"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -20,7 +21,7 @@ func (m *Manager) OnProxyStarted() {
 	}
 
 	m.startStopMenuItem.SetTitle("Stop")
-	m.startStopMenuItem.SetTooltip("Stop")
+	m.startStopMenuItem.update()
 }
 
 // OnProxyStopped should be called when the proxy gets stopped.
@@ -36,22 +37,31 @@ func (m *Manager) OnProxyStopped() {
 	}
 
 	m.startStopMenuItem.SetTitle("Start")
-	m.startStopMenuItem.SetTooltip("Start")
+	m.startStopMenuItem.update()
 }
 
 func (m *Manager) onReady(ctx context.Context) func() {
 	return func() {
 		setIcon(m.logoBytes)
-		setTooltip(m.appName)
 
-		openMenuItem := addMenuItem("Open", "Open the application window")
+		openMenuItem := addMenuItem("Open")
 		go func() {
 			for range openMenuItem.ClickedCh {
 				runtime.Show(ctx)
 			}
 		}()
 
-		m.startStopMenuItem = addMenuItem("Start", "Start")
+		m.mu.Lock()
+
+		startStopTitle := "Start"
+		if m.proxyActive {
+			startStopTitle = "Stop"
+		}
+
+		startStopMenuItem := addMenuItem(startStopTitle)
+		m.startStopMenuItem = startStopMenuItem
+		m.mu.Unlock()
+
 		go func() {
 			for range m.startStopMenuItem.ClickedCh {
 				m.mu.Lock()
@@ -65,9 +75,10 @@ func (m *Manager) onReady(ctx context.Context) func() {
 			}
 		}()
 
-		addSeparator()
+		id := atomic.AddUint32(&currentID, 1)
+		addSeparator(id)
 
-		quitMenuItem := addMenuItem("Quit", "Quit the application")
+		quitMenuItem := addMenuItem("Quit")
 		go func() {
 			for range quitMenuItem.ClickedCh {
 				runtime.Quit(ctx)

@@ -1,5 +1,3 @@
-//go:build !windows
-
 package systray
 
 // To be implemented.

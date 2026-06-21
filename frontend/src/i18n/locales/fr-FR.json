@@ -125,10 +125,16 @@
       "title": "Bienvenue dans Zen !"
     }
   },
+  "pacPortInput": {
+    "description": "Port sur lequel le serveur PAC (configuration automatique du proxy) écoutera (0 pour aléatoire).",
+    "helper": "Utiliser un port inférieur à 1024 nécessitera des privilèges administrateur.",
+    "label": "Port du serveur PAC",
+    "setError": "Échec de la définition du port du serveur PAC : {{error}}"
+  },
   "portInput": {
     "description": "Port sur lequel le serveur proxy écoutera (0 pour aléatoire).",
     "helper": "Utiliser un port inférieur à 1024 nécessitera des privilèges administrateur.",
-    "label": "Port"
+    "label": "Port du proxy"
   },
   "requestLog": {
     "emptyState": "Commencez à naviguer pour voir des requêtes bloquées.",

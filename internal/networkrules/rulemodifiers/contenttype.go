@@ -36,6 +36,7 @@ var (
 	// contentTypeMap maps Content-Type MIME types to corresponding content type modifiers.
 	contentTypeMap = map[string]string{
 		"text/css":                      "stylesheet",
+		"text/ping":                     "ping",
 		"text/javascript":               "script",
 		"application/javascript":        "script",
 		"image":                         "image",
@@ -59,6 +60,19 @@ func (m *ContentTypeModifier) Parse(modifier string) error {
 }
 
 func (m *ContentTypeModifier) ShouldMatchReq(req *http.Request) bool {
+	mimeType := m.getMimeType(req.Header)
+
+	hasPingHeaders := req.Header.Get("Ping-To") != "" || req.Header.Get("Ping-From") != ""
+	isPing := hasPingHeaders && mimeType == "text/ping"
+
+	if isPing {
+		return (m.contentType == "ping") != m.inverted
+	}
+
+	if m.contentType == "ping" {
+		return m.inverted
+	}
+
 	secFetchDest := req.Header.Get("Sec-Fetch-Dest")
 	if secFetchDest == "" {
 		if m.contentType == "websocket" {
@@ -85,15 +99,10 @@ func (m *ContentTypeModifier) ShouldMatchReq(req *http.Request) bool {
 }
 
 func (m *ContentTypeModifier) ShouldMatchRes(res *http.Response) bool {
-	contentType := res.Header.Get("Content-Type")
-	if contentType == "" {
+	mimeType := m.getMimeType(res.Header)
+	if mimeType == "" {
 		return false
 	}
-
-	// strip parameters like charset
-	mimeType, _, _ := strings.Cut(contentType, ";")
-	mimeType = strings.TrimSpace(mimeType)
-	mimeType = strings.ToLower(mimeType)
 
 	normalized, known := mapResponseContentTypeToModifier(mimeType)
 	if m.contentType == "other" {
@@ -143,4 +152,18 @@ func headerContains(h http.Header, name, value string) bool {
 		}
 	}
 	return false
+}
+
+func (m *ContentTypeModifier) getMimeType(header http.Header) string {
+	contentType := header.Get("Content-Type")
+	if contentType == "" {
+		return ""
+	}
+
+	// strip parameters like charset
+	mimeType, _, _ := strings.Cut(contentType, ";")
+	mimeType = strings.TrimSpace(mimeType)
+	mimeType = strings.ToLower(mimeType)
+
+	return mimeType
 }

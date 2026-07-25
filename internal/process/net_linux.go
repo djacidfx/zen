@@ -1,23 +1,52 @@
+//go:build linux
+
 package process
 
 import (
-	"bufio"
+	"encoding/binary"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
+
+	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
-func findPIDBySourcePort(port uint16) (PID, error) {
-	if port == 0 {
-		return 0, ErrNotFound
-	}
+// Offsets/sizes from struct inet_diag_msg in linux/inet_diag.h:
+// https://github.com/torvalds/linux/blob/248951ddc14de84de3910f9b13f51491a8cd91df/include/uapi/linux/inet_diag.h#L117
+const (
+	// Layout of nlmsghdr + inet_diag_req_v2 for AF_INET/TCP requests.
+	inetDiagReqMsgSize = 72
 
-	inode, err := findInode(port)
+	nlMsgLenOffset   = 0
+	nlMsgTypeOffset  = 4
+	nlMsgFlagsOffset = 6
+	nlMsgSeqOffset   = 8
+
+	inetDiagReqFamilyOffset   = 16
+	inetDiagReqProtocolOffset = 17
+	inetDiagReqStatesOffset   = 20
+	inetDiagReqSrcPortOffset  = 24
+	inetDiagReqDstPortOffset  = 26
+	inetDiagReqSrcAddrOffset  = 28
+	inetDiagReqDstAddrOffset  = 44
+	inetDiagReqCookie0Offset  = 64
+	inetDiagReqCookie1Offset  = 68
+
+	inetDiagMsgInodeOffset = 68
+	inetDiagMsgInodeSize   = 4
+	inetDiagMsgMinSize     = inetDiagMsgInodeOffset + inetDiagMsgInodeSize
+)
+
+// findPIDByIP finds the PID of the process that owns the TCP connection specified by the source and destination IP addresses and ports.
+func findPIDByIP(srcPort, dstPort uint16, srcIP, dstIP net.IP) (PID, error) {
+	inode, err := findInode(srcPort, dstPort, srcIP, dstIP)
 	if err != nil {
-		return 0, fmt.Errorf("find inode: %w", err)
+		return 0, fmt.Errorf("find inode by netlink: %w", err)
 	}
 
 	pid, err := findPID(inode)
@@ -28,60 +57,113 @@ func findPIDBySourcePort(port uint16) (PID, error) {
 	return pid, nil
 }
 
-// findInode finds the inode corresponding to a file descriptor
-// associated with a TCP socket with the given port.
-func findInode(port uint16) (uint64, error) {
-	f, err := os.Open("/proc/net/tcp")
+// findInode finds the inode number of the socket associated with the given source and destination IP addresses and ports using netlink.
+func findInode(srcPort, dstPort uint16, srcIP, dstIP net.IP) (uint64, error) {
+
+	// Create a netlink socket to communicate with the kernel
+	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_SOCK_DIAG)
 	if err != nil {
-		return 0, fmt.Errorf("open /proc/net/tcp: %v", err)
+		return 0, fmt.Errorf("create netlink socket: %v", err)
 	}
-	defer f.Close()
+	defer unix.Close(fd)
 
-	scanner := bufio.NewScanner(f)
-	scanner.Scan() // Skip header line.
+	ip4Src := srcIP.To4()
+	ip4Dst := dstIP.To4()
+	if ip4Src == nil || ip4Dst == nil {
+		return 0, fmt.Errorf("only IPv4 addresses are supported")
+	}
 
-	var inode string
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) < 10 {
-			return 0, fmt.Errorf("parse /proc/net/tcp: expected at least 10 fields, got %d", len(fields))
-		}
+	// Build nlmsghdr + inet_diag_req_v2 in a fixed-size stack buffer
+	var msg [inetDiagReqMsgSize]byte
+	binary.NativeEndian.PutUint32(msg[nlMsgLenOffset:nlMsgLenOffset+4], inetDiagReqMsgSize)
+	binary.NativeEndian.PutUint16(msg[nlMsgTypeOffset:nlMsgTypeOffset+2], unix.SOCK_DIAG_BY_FAMILY)
+	binary.NativeEndian.PutUint16(msg[nlMsgFlagsOffset:nlMsgFlagsOffset+2], unix.NLM_F_REQUEST)
+	binary.NativeEndian.PutUint32(msg[nlMsgSeqOffset:nlMsgSeqOffset+4], 1)
 
-		localAddr := fields[1]
-		_, localPort, found := strings.Cut(localAddr, ":")
-		if !found {
-			return 0, fmt.Errorf("parse /proc/net/tcp: malformed local addr %q", localAddr)
-		}
+	msg[inetDiagReqFamilyOffset] = unix.AF_INET
+	msg[inetDiagReqProtocolOffset] = unix.IPPROTO_TCP
+	binary.NativeEndian.PutUint32(msg[inetDiagReqStatesOffset:inetDiagReqStatesOffset+4], 0xffffffff)
+	binary.BigEndian.PutUint16(msg[inetDiagReqSrcPortOffset:inetDiagReqSrcPortOffset+2], srcPort)
+	binary.BigEndian.PutUint16(msg[inetDiagReqDstPortOffset:inetDiagReqDstPortOffset+2], dstPort)
+	copy(msg[inetDiagReqSrcAddrOffset:inetDiagReqSrcAddrOffset+4], ip4Src)
+	copy(msg[inetDiagReqDstAddrOffset:inetDiagReqDstAddrOffset+4], ip4Dst)
+	binary.NativeEndian.PutUint32(msg[inetDiagReqCookie0Offset:inetDiagReqCookie0Offset+4], 0xffffffff)
+	binary.NativeEndian.PutUint32(msg[inetDiagReqCookie1Offset:inetDiagReqCookie1Offset+4], 0xffffffff)
 
-		localPortNum, err := strconv.ParseUint(localPort, 16, 16)
-		if err != nil {
-			return 0, fmt.Errorf("parse /proc/net/tcp: parse port %q: %v", localPort, err)
-		}
+	// Send the netlink request to the kernel
+	sa := &unix.SockaddrNetlink{Family: unix.AF_NETLINK}
+	if err := unix.Sendto(fd, msg[:], 0, sa); err != nil {
+		return 0, fmt.Errorf("send netlink request: %v", err)
+	}
 
-		if uint64(port) == localPortNum {
-			inode = fields[9]
+	// Receive the response from the kernel
+	resBuf := make([]byte, 16384)
+	n, from, err := unix.Recvfrom(fd, resBuf, 0)
+
+	if err != nil {
+		return 0, fmt.Errorf("receive netlink response: %v", err)
+	}
+
+	// Validate that the response is from the kernel (pid 0)
+	nlFrom, ok := from.(*unix.SockaddrNetlink)
+	if !ok {
+		return 0, fmt.Errorf("unexpected socket address type: %T", from)
+	}
+	if nlFrom.Pid != 0 {
+		return 0, fmt.Errorf("unexpected netlink response from non-kernel source (pid: %d)", nlFrom.Pid)
+	}
+
+	// Parse the netlink messages from the response buffer
+	messages, err := syscall.ParseNetlinkMessage(resBuf[:n])
+	if err != nil {
+		return 0, fmt.Errorf("parse netlink message: %v", err)
+	}
+
+	// Iterate through the netlink messages to find the inode of the socket
+	for _, msg := range messages {
+		if msg.Header.Type == unix.NLMSG_DONE {
 			break
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		return 0, fmt.Errorf("read /proc/net/tcp: %v", err)
+
+		if msg.Header.Type == unix.NLMSG_ERROR {
+			if len(msg.Data) < 4 {
+				return 0, fmt.Errorf("netlink error: missing data")
+			}
+
+			errno := int32(binary.NativeEndian.Uint32(msg.Data[:4])) // #nosec G115 -- nlmsgerr.error is a signed int32 reinterpreted from raw bytes
+			if errno == 0 {
+				continue
+			}
+
+			if errno > 0 {
+				return 0, fmt.Errorf("unexpected positive netlink errno: %d", errno)
+			}
+
+			kernelErr := unix.Errno(-errno)
+			if kernelErr == unix.ENOENT {
+				return 0, ErrNotFound
+			}
+			return 0, fmt.Errorf("netlink kernel error: %w", kernelErr)
+
+		}
+
+		// Check if the message is of type SOCK_DIAG_BY_FAMILY and extract the inode from the message data.
+		if msg.Header.Type == unix.SOCK_DIAG_BY_FAMILY {
+			if len(msg.Data) < inetDiagMsgMinSize {
+				continue
+			}
+
+			inode := binary.NativeEndian.Uint32(msg.Data[inetDiagMsgInodeOffset : inetDiagMsgInodeOffset+inetDiagMsgInodeSize])
+			if inode != 0 {
+				return uint64(inode), nil
+			}
+		}
 	}
 
-	if inode == "" {
-		return 0, ErrNotFound
-	}
-
-	inodeNum, err := strconv.ParseUint(inode, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parse /proc/net/tcp: parse inode %q: %v", inode, err)
-	}
-	if inodeNum == 0 {
-		return 0, fmt.Errorf("socket has already been closed")
-	}
-
-	return inodeNum, nil
+	return 0, ErrNotFound
 }
 
+// findPID finds the PID of the process that owns the socket with the given inode by scanning the /proc filesystem.
 func findPID(inode uint64) (PID, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {

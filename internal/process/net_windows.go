@@ -2,21 +2,23 @@ package process
 
 import (
 	"fmt"
+	"net"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
-func findPIDBySourcePort(port uint16) (PID, error) {
-	if port == 0 {
+func findPIDByIP(srcPort, dstPort uint16, srcIP, dstIP net.IP) (PID, error) {
+	if srcPort == 0 {
 		return 0, ErrNotFound
 	}
 
-	pid, err := findPidByPort(port)
+	pid, err := findPidByPort(srcPort)
 	if err != nil {
 		return 0, err
 	}
+
 	return PID(pid), nil
 }
 

@@ -1,6 +1,7 @@
 package process
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"os"
@@ -8,23 +9,25 @@ import (
 	"time"
 )
 
-func BenchmarkFindPIDBySourcePort(b *testing.B) {
+func BenchmarkFindPIDByIP(b *testing.B) {
 	conn := newBenchmarkTCPConnection(b)
-	port := uint16(conn.sourcePort) // #nosec G115 -- TCP ports fit in uint16.
 
 	b.ResetTimer()
 
 	for b.Loop() {
-		_, err := findPIDBySourcePort(port)
+		_, err := findPIDByIP(conn.srcPort, conn.dstPort, conn.srcIP, conn.dstIP)
 		if err != nil {
-			b.Fatalf("findPIDBySourcePort(%d): %v", conn.sourcePort, err)
+			b.Fatalf("findPIDByIP: %v", err)
 		}
 	}
 }
 
 func BenchmarkFindByRequest(b *testing.B) {
 	conn := newBenchmarkTCPConnection(b)
-	req := &http.Request{RemoteAddr: conn.remoteAddr}
+	req := &http.Request{
+		RemoteAddr: conn.remoteAddr,
+	}
+	req = req.WithContext(context.WithValue(req.Context(), http.LocalAddrContextKey, conn.localAddr))
 
 	b.ResetTimer()
 
@@ -42,7 +45,10 @@ func BenchmarkFindByRequestParallel(b *testing.B) {
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
-		req := &http.Request{RemoteAddr: conn.remoteAddr}
+		req := &http.Request{
+			RemoteAddr: conn.remoteAddr,
+		}
+		req = req.WithContext(context.WithValue(req.Context(), http.LocalAddrContextKey, conn.localAddr))
 
 		for pb.Next() {
 			_, err := FindByRequest(req)
@@ -100,7 +106,11 @@ func BenchmarkInfoNameWithoutExecutablePath(b *testing.B) {
 
 type benchmarkTCPConnection struct {
 	remoteAddr string
-	sourcePort int
+	localAddr  net.Addr
+	srcPort    uint16
+	dstPort    uint16
+	srcIP      net.IP
+	dstIP      net.IP
 }
 
 func newBenchmarkTCPConnection(tb testing.TB) *benchmarkTCPConnection {
@@ -142,18 +152,26 @@ func newBenchmarkTCPConnection(tb testing.TB) *benchmarkTCPConnection {
 	}
 
 	remoteAddr := clientConn.LocalAddr().String()
-	tcpAddr, ok := clientConn.LocalAddr().(*net.TCPAddr)
-	if !ok {
+
+	srcAddr, ok1 := clientConn.LocalAddr().(*net.TCPAddr)
+	dstAddr, ok2 := clientConn.RemoteAddr().(*net.TCPAddr)
+
+	if !ok1 || !ok2 {
 		clientConn.Close()
 		serverConn.Close()
 		ln.Close()
-		tb.Fatalf("client local address has type %T, want *net.TCPAddr", clientConn.LocalAddr())
+		tb.Fatalf("failed to cast network addresses to *net.TCPAddr")
 	}
 
 	conn := &benchmarkTCPConnection{
 		remoteAddr: remoteAddr,
-		sourcePort: tcpAddr.Port,
+		localAddr:  serverConn.LocalAddr(),
+		srcPort:    tcpPort(tb, srcAddr.Port),
+		dstPort:    tcpPort(tb, dstAddr.Port),
+		srcIP:      srcAddr.IP,
+		dstIP:      dstAddr.IP,
 	}
+
 	tb.Cleanup(func() {
 		clientConn.Close()
 		serverConn.Close()

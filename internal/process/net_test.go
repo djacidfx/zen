@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestFindPIDBySourcePort(t *testing.T) {
+func TestFindPIDByIP(t *testing.T) {
 	t.Parallel()
 
 	t.Run("finds owning process for active connection", func(t *testing.T) {
@@ -33,15 +33,22 @@ func TestFindPIDBySourcePort(t *testing.T) {
 		}
 		defer conn.Close()
 
-		if sc := <-serverConn; sc != nil {
-			defer sc.Close()
+		var sConn net.Conn
+		if sConn = <-serverConn; sConn != nil {
+			defer sConn.Close()
 		}
 
-		port := conn.LocalAddr().(*net.TCPAddr).Port
+		srcAddr := conn.LocalAddr().(*net.TCPAddr)
+		dstAddr := conn.RemoteAddr().(*net.TCPAddr)
 
-		pid, err := findPIDBySourcePort(uint16(port)) // #nosec G115 -- port will fit in uint16
+		srcPort := tcpPort(t, srcAddr.Port)
+		dstPort := tcpPort(t, dstAddr.Port)
+		srcIP := srcAddr.IP
+		dstIP := dstAddr.IP
+
+		pid, err := findPIDByIP(srcPort, dstPort, srcIP, dstIP)
 		if err != nil {
-			t.Fatalf("findPIDBySourcePort(%d): %v", port, err)
+			t.Fatalf("findPIDByIP failed: %v", err)
 		}
 
 		if int(pid) != os.Getpid() {
@@ -49,11 +56,40 @@ func TestFindPIDBySourcePort(t *testing.T) {
 		}
 	})
 
-	t.Run("returns ErrNotFound for unbound port", func(t *testing.T) {
+	t.Run("returns error for unbound port or non-existent connection", func(t *testing.T) {
+		t.Parallel()
+		l1, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		srcPort := tcpPort(t, l1.Addr().(*net.TCPAddr).Port)
+		_ = l1.Close()
+
+		l2, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		dstPort := tcpPort(t, l2.Addr().(*net.TCPAddr).Port)
+		_ = l2.Close()
+
+		ip := net.ParseIP("127.0.0.1")
+		_, err = findPIDByIP(srcPort, dstPort, ip, ip)
+
+		if !errors.Is(err, ErrNotFound) {
+			t.Errorf("err = %v, want %v", err, ErrNotFound)
+		}
+	})
+
+	t.Run("srcPort=0 returns early", func(t *testing.T) {
 		t.Parallel()
 
-		if _, err := findPIDBySourcePort(0); !errors.Is(err, ErrNotFound) {
+		dummyIP := net.ParseIP("127.0.0.1")
+		pid, err := findPIDByIP(0, 0, dummyIP, dummyIP)
+		if !errors.Is(err, ErrNotFound) {
 			t.Errorf("err = %v, want %v", err, ErrNotFound)
+		}
+		if pid != 0 {
+			t.Errorf("pid = %d, want 0", pid)
 		}
 	})
 }
@@ -111,4 +147,14 @@ func TestFindByRequest(t *testing.T) {
 			t.Fatal("err = nil")
 		}
 	})
+}
+
+func tcpPort(tb testing.TB, port int) uint16 {
+	tb.Helper()
+
+	if port < 0 || port > 65535 {
+		tb.Fatalf("port out of range: %d", port)
+	}
+
+	return uint16(port) // #nosec G115 -- port was validated to fit in uint16 above.
 }

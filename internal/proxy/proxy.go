@@ -20,6 +20,17 @@ import (
 	"github.com/irbis-sh/zen-desktop/internal/redacted"
 )
 
+const (
+	dialTimeout           = 60 * time.Second
+	dialKeepAlive         = 30 * time.Second
+	tlsHandshakeTimeout   = 20 * time.Second
+	responseHeaderTimeout = 3 * time.Minute
+	idleConnTimeout       = 90 * time.Second
+
+	maxIdleConns        = 512
+	maxIdleConnsPerHost = 16
+)
+
 // certGenerator is an interface capable of generating certificates for the proxy.
 type certGenerator interface {
 	GetCertificate(host string) (*tls.Certificate, error)
@@ -65,19 +76,22 @@ func NewProxy(filter filter, certGenerator certGenerator, port int, shouldProxy 
 	}
 
 	p.netDialer = &net.Dialer{
-		// Such high values are set to avoid timeouts on slow connections.
-		Timeout:   60 * time.Second,
-		KeepAlive: 30 * time.Second,
+		Timeout:   dialTimeout,
+		KeepAlive: dialKeepAlive,
 	}
 	p.requestTransport = &http.Transport{
-		DialContext:         p.netDialer.DialContext,
-		ForceAttemptHTTP2:   true,
-		TLSHandshakeTimeout: 20 * time.Second,
-		MaxIdleConns:        100,
-		IdleConnTimeout:     90 * time.Second,
+		DialContext:           p.netDialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		MaxIdleConns:          maxIdleConns,
+		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
+		IdleConnTimeout:       idleConnTimeout,
 	}
 	p.requestClient = &http.Client{
-		Timeout:   60 * time.Second,
+		// Timeout is deliberately unset: it covers the response body read, which would make
+		// it exactly the total budget the timeouts above rule out. Ending a transfer is the
+		// client's call.
 		Transport: p.requestTransport,
 		// Let the client handle any redirects.
 		CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -93,7 +107,9 @@ func NewProxy(filter filter, certGenerator certGenerator, port int, shouldProxy 
 // If Proxy was configured with a port of 0, the actual port will be returned.
 func (p *Proxy) Start() (int, error) {
 	p.server = &http.Server{
-		Handler:           p,
+		Handler: p,
+		// WriteTimeout is deliberately unset: it caps the whole handler, response write
+		// included, and would truncate large downloads and long-lived streams.
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", "127.0.0.1", p.port))
@@ -114,7 +130,15 @@ func (p *Proxy) Start() (int, error) {
 
 // Stop stops the proxy.
 func (p *Proxy) Stop() error {
-	if err := p.shutdownServer(); err != nil {
+	err := p.shutdownServer()
+
+	// Shutdown only closes inbound connections, and runs first so that requests still in
+	// flight cannot return an upstream connection to the pool after it has been drained.
+	// Left alone, those connections and their read and write goroutines outlive the proxy
+	// until idleConnTimeout.
+	p.requestClient.CloseIdleConnections()
+
+	if err != nil {
 		return fmt.Errorf("shut down server: %v", err)
 	}
 
@@ -450,7 +474,7 @@ func (p *Proxy) addTransparentHost(host string) {
 // tunnel tunnels the connection between the client and the remote server
 // without inspecting the traffic.
 func (p *Proxy) tunnel(w net.Conn, r *http.Request) {
-	remoteConn, err := net.Dial("tcp", r.Host) // #nosec G704 -- this is a proxy; forwarding connections is its purpose
+	remoteConn, err := p.netDialer.DialContext(r.Context(), "tcp", r.Host) // #nosec G704 -- this is a proxy; forwarding connections is its purpose
 	if err != nil {
 		log.Printf("dialing remote(%s): %v", redacted.Redacted(r.Host), err)
 		w.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
